@@ -20,6 +20,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
+#include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,9 +29,8 @@ SOFTWARE.
 #include <time.h>
 #include <pthread.h>
 #include "gpio.h"
+#include "cpuinfo.h"
 
-#define BCM2708_PERI_BASE   0x20000000
-#define GPIO_BASE           (BCM2708_PERI_BASE + 0x200000)
 #define FSEL_OFFSET         0   // 0x0000
 #define SET_OFFSET          7   // 0x001c / 4
 #define CLR_OFFSET          10  // 0x0028 / 4
@@ -42,6 +42,11 @@ SOFTWARE.
 #define LOW_DETECT_OFFSET   28  // 0x0070 / 4
 #define PULLUPDN_OFFSET     37  // 0x0094 / 4
 #define PULLUPDNCLK_OFFSET  38  // 0x0098 / 4
+
+#define PULLUPDN_OFFSET_2711_0      57
+#define PULLUPDN_OFFSET_2711_1      58
+#define PULLUPDN_OFFSET_2711_2      59
+#define PULLUPDN_OFFSET_2711_3      60
 
 #define PAGE_SIZE  (4*1024)
 #define BLOCK_SIZE (4*1024)
@@ -83,7 +88,31 @@ int setup(void)
     if ((uint32_t)gpio_mem % PAGE_SIZE)
         gpio_mem += PAGE_SIZE - ((uint32_t)gpio_mem % PAGE_SIZE);
 
-    gpio_map = (uint32_t *)mmap( (caddr_t)gpio_mem, BLOCK_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED, mem_fd, GPIO_BASE);
+    char buffer[12];
+    const char *ranges_file = "/proc/device-tree/soc/ranges";
+    int info_fd = open(ranges_file, O_RDONLY);
+
+    if (info_fd < 0) {
+        fprintf(stderr, "cannot open: %s", ranges_file);
+        return SETUP_MMAP_FAIL;
+    }
+
+    ssize_t n = read(info_fd, buffer, sizeof(buffer));
+    close(info_fd);
+
+    if (n < 8) {
+        fprintf(stderr, "cannot read base address: %s", ranges_file);
+        return SETUP_MMAP_FAIL;
+    }
+
+    uint32_t gpio_offset = 0x00200000;
+    uint32_t gpio_base =  (buffer[4] << 24) + (buffer[5] << 16) + (buffer[6] << 8) + (buffer[7] << 0) + gpio_offset;
+
+    if (gpio_base == gpio_offset) {
+        gpio_base =  (buffer[8] << 24) + (buffer[9] << 16) + (buffer[10] << 8) + (buffer[11] << 0) + gpio_offset;
+    }
+
+    gpio_map = (uint32_t *)mmap( (caddr_t)gpio_mem, BLOCK_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED, mem_fd, gpio_base);
 
     if ((uint32_t)gpio_map < 0)
         return SETUP_MMAP_FAIL;
@@ -93,21 +122,44 @@ int setup(void)
 
 void set_pullupdn(int gpio, int pud)
 {
-    int clk_offset = PULLUPDNCLK_OFFSET + (gpio/32);
-    int shift = (gpio%32);
-    
-    if (pud == PUD_DOWN)
-       *(gpio_map+PULLUPDN_OFFSET) = (*(gpio_map+PULLUPDN_OFFSET) & ~3) | PUD_DOWN;
-    else if (pud == PUD_UP)
-       *(gpio_map+PULLUPDN_OFFSET) = (*(gpio_map+PULLUPDN_OFFSET) & ~3) | PUD_UP;
-    else  // pud == PUD_OFF
-       *(gpio_map+PULLUPDN_OFFSET) &= ~3;
-    
-    short_wait();
-    *(gpio_map+clk_offset) = 1 << shift;
-    short_wait();
-    *(gpio_map+PULLUPDN_OFFSET) &= ~3;
-    *(gpio_map+clk_offset) = 0;
+    // Check GPIO register
+    int is2711 = *(gpio_map+PULLUPDN_OFFSET_2711_3) != 0x6770696f;
+    if (is2711) {
+        // Pi 4 Pull-up/down method
+       int pullreg = PULLUPDN_OFFSET_2711_0 + (gpio >> 4);
+       int pullshift = (gpio & 0xf) << 1;
+       unsigned int pullbits;
+       unsigned int pull = 0;
+       if (pud == PUD_DOWN){
+           pull = 2;
+        } else
+        if (pud == PUD_UP){
+           pull = 1;
+        }
+        pullbits = *(gpio_map + pullreg);
+        pullbits &= ~(3 << pullshift);
+        pullbits |= (pull << pullshift);
+        *(gpio_map + pullreg) = pullbits;
+    }
+    else
+    {
+        // Legacy Pull-up/down method
+        int clk_offset = PULLUPDNCLK_OFFSET + (gpio/32);
+        int shift = (gpio%32);
+
+        if (pud == PUD_DOWN)
+            *(gpio_map+PULLUPDN_OFFSET) = (*(gpio_map+PULLUPDN_OFFSET) & ~3) | PUD_DOWN;
+        else if (pud == PUD_UP)
+            *(gpio_map+PULLUPDN_OFFSET) = (*(gpio_map+PULLUPDN_OFFSET) & ~3) | PUD_UP;
+        else  // pud == PUD_OFF
+            *(gpio_map+PULLUPDN_OFFSET) &= ~3;
+
+        short_wait();
+        *(gpio_map+clk_offset) = 1 << shift;
+        short_wait();
+        *(gpio_map+PULLUPDN_OFFSET) &= ~3;
+        *(gpio_map+clk_offset) = 0;
+    }
 }
 
 //updated Eric PTAK - trouch.com

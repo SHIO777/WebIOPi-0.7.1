@@ -194,13 +194,23 @@ class HTTPHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         
         (contentType, encoding) = mime.guess_type(path)
         f = codecs.open(path, encoding=encoding)
-        data = f.read()
+        try:
+            data = f.read()
+        except UnicodeDecodeError:
+            f.close()
+            f = codecs.open(path, mode='rb', encoding=encoding)
+            data = f.read()
         f.close()
         self.send_response(200)
         self.send_header("Content-Type", contentType);
-        self.send_header("Content-Length", os.path.getsize(realPath))
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_header("Content-Length", len(data.encode()))
+            self.end_headers()
+            self.wfile.write(data.encode())
+        except AttributeError:
+            self.send_header("Content-Length", os.path.getsize(realPath))
+            self.end_headers()
+            self.wfile.write(data)
         self.logRequest(200)
         
     def processRequest(self):
